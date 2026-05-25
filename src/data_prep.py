@@ -14,7 +14,7 @@ Responsibilities
 
 Design notes
 ------------
-* All values arrive as ``Utf8`` when ``infer_schema_length=0`` is set (we own
+* All values arrive as ``String`` when ``infer_schema_length=0`` is set (we own
   the schema, the file should not).  Empty strings are normalised to ``null``
   before any cast so that sparsity is represented uniformly as ``null``.
 * The pivot uses ``aggregate_function="first"`` to be resilient against
@@ -22,7 +22,7 @@ Design notes
 * ``is_lazy=True`` leverages ``pl.scan_csv`` for initial I/O, which keeps
   memory pressure low when sampling the 42 GB Live file for EDA.  Full
   streaming inference (Phase 5) uses a separate chunked pipeline.
-* Multi-categorical drivers (Utf8) are intentionally left as raw strings;
+* Multi-categorical drivers (String) are intentionally left as raw strings;
   ``src/features.py`` owns their CountVectorizer expansion.
 """
 
@@ -42,7 +42,7 @@ import polars as pl
 _DRIVER_TYPE_TO_POLARS: dict[str, pl.DataType] = {
     "numeric": pl.Float32,
     "categorical": pl.Categorical,
-    "multi_categorical": pl.Utf8,   # kept as raw string; expanded in features.py
+    "multi_categorical": pl.String,  # kept as raw string; expanded in features.py
 }
 
 # Metadata columns that are never treated as driver features.
@@ -107,7 +107,7 @@ def parse_driver_definitions(filepath: str | Path) -> dict[str, pl.DataType]:
         # Warn but do not crash — future driver types should not block the pipeline.
         import warnings
         warnings.warn(
-            f"Unrecognised driverType(s) — these columns will remain as Utf8:\n"
+            f"Unrecognised driverType(s) — these columns will remain as String:\n"
             + "\n".join(f"  • {m}" for m in unknown_types),
             stacklevel=2,
         )
@@ -150,19 +150,33 @@ def load_and_pivot_data(
         Wide-format DataFrame: one row per (sourceId, sourceUniqueId), one
         column per driver key, plus ``npsDate`` and ``npsScore`` where present.
         Numeric columns are ``Float32``; categorical columns are ``Categorical``;
-        multi-categorical columns remain ``Utf8``.
+        multi-categorical columns remain ``String``.
 
     Raises
     ------
     FileNotFoundError
         If ``filepath`` does not exist.
+    MemoryError
+        If the Live dataset is requested without row capping in eager mode.
     """
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(f"Data file not found: {filepath}")
 
     # ------------------------------------------------------------------
-    # Step 1 — Load raw EAV rows, all as Utf8 (we control the schema)
+    # Safety guardrail — prevent accidental full eager load of the 42 GB
+    # Live file (314 M rows).  Callers must either use is_lazy=True or
+    # supply an explicit n_rows cap when working with the Live dataset.
+    # ------------------------------------------------------------------
+    if "live" in filepath.name.lower() and not is_lazy and n_rows is None:
+        raise MemoryError(
+            "Do not load the full Live dataset eagerly. "
+            "Use is_lazy=True for sampling, or supply n_rows for a bounded eager read. "
+            "Full 314M-row inference must go through the chunked streaming pipeline (Phase 5)."
+        )
+
+    # ------------------------------------------------------------------
+    # Step 1 — Load raw EAV rows, all as String (we control the schema)
     # ------------------------------------------------------------------
     if is_lazy:
         lazy_frame: pl.LazyFrame = pl.scan_csv(
@@ -242,8 +256,8 @@ def _build_cast_exprs(
     """Return a list of Polars expressions that cast driver columns to their
     declared types, normalising empty strings to ``null`` first.
 
-    Multi-categorical columns (Utf8) are only null-normalised — no actual
-    dtype change is needed since the pivot already produces Utf8.
+    Multi-categorical columns (String) are only null-normalised — no actual
+    dtype change is needed since the pivot already produces String.
     """
     exprs: list[pl.Expr] = []
 
@@ -255,10 +269,10 @@ def _build_cast_exprs(
         if target_dtype is None:
             continue  # driver not in definitions — leave as Utf8
 
-        # Normalise empty strings to null (CSV empty cell = "" after Utf8 read)
+        # Normalise empty strings to null (CSV empty cell = "" after String read)
         null_normalised = (
             pl.when(pl.col(col_name) == "")
-            .then(pl.lit(None, dtype=pl.Utf8))
+            .then(pl.lit(None, dtype=pl.String))
             .otherwise(pl.col(col_name))
         )
 
@@ -272,7 +286,7 @@ def _build_cast_exprs(
                 null_normalised.cast(pl.Categorical).alias(col_name)
             )
         else:
-            # multi_categorical: Utf8 → Utf8 (null-normalise only)
+            # multi_categorical: String → String (null-normalise only)
             exprs.append(null_normalised.alias(col_name))
 
     return exprs
