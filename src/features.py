@@ -417,3 +417,92 @@ def numeric_collinearity_filter(
         print(f"      reason: |ρ|={rho:.3f} with {keep_col}  ({reason})")
 
     return df.drop(list(dropped))
+
+
+# ---------------------------------------------------------------------------
+# Delay Severity Flag
+# ---------------------------------------------------------------------------
+
+_DELAY_SOURCE_COL: str = "transactionalTravelTripAverageDelayDurationV0Last30d"
+_DELAY_FLAG_COL: str = "is_severe_delay_10m_plus"
+
+
+def add_severe_delay_flag(
+    df: pl.DataFrame,
+    threshold: float = 10.0,
+) -> pl.DataFrame:
+    """Append a binary severity flag for operationally significant delays.
+
+    **Motivation — the Information Gain Trap**
+
+    The average delay distribution is heavily right-skewed: the vast
+    majority of customers experience negligible or zero delay, while a small
+    minority suffer severe disruptions that are causally responsible for the
+    bulk of detractor conversions.  In the absence of an explicit partition
+    signal, a gradient-boosted tree evaluates splits greedily on log-loss
+    reduction across the *full* population.  Because the majority-class
+    "no-delay" node is already nearly pure, splitting it yields a large
+    nominal information gain — far larger, in absolute terms, than isolating
+    the high-delay tail even though the tail dominates detractor risk.  The
+    tree therefore relegates the causal delay signal to mid-depth branches
+    where it competes with dozens of other drivers.
+
+    By surfacing an explicit ``is_severe_delay_10m_plus`` flag we hand the
+    model a *pre-computed high-quality partition* at the root level.  LightGBM
+    can then use ``TravelTripAverageDelayDuration`` continuously further down
+    the branches to resolve finer causal inflection points, rather than
+    rediscovering the coarse 10-minute boundary through brute-force search.
+
+    **Null preservation**
+
+    Customers for whom ``TravelTripAverageDelayDuration`` is null did not
+    travel in the 30-day window.  The flag is left as ``null`` for these
+    customers, preserving LightGBM's native NaN-routing logic.  This is
+    critical: imputing 0 (no severe delay) for non-travellers would inject
+    a false negative signal into the causal analysis.
+
+    Parameters
+    ----------
+    df:
+        Wide-format Polars DataFrame containing the delay duration column.
+    threshold:
+        Delay duration in minutes above which a journey is classified as
+        severe.  Defaults to ``10.0``, which aligns with Deutsche Bahn's
+        internal on-time definition (arrivals > 10 min late are officially
+        "delayed").
+
+    Returns
+    -------
+    pl.DataFrame
+        Input DataFrame with ``is_severe_delay_10m_plus`` appended as
+        ``pl.Int8`` (``1`` = severe, ``0`` = not severe, ``null`` = no travel).
+    """
+    if _DELAY_SOURCE_COL not in df.columns:
+        raise KeyError(
+            f"Expected column '{_DELAY_SOURCE_COL}' not found in DataFrame. "
+            f"Ensure the delay duration driver was not dropped by an earlier filter."
+        )
+
+    flag_expr = (
+        pl.when(pl.col(_DELAY_SOURCE_COL).is_null())
+        .then(pl.lit(None, dtype=pl.Int8))
+        .when(pl.col(_DELAY_SOURCE_COL) > threshold)
+        .then(pl.lit(1, dtype=pl.Int8))
+        .otherwise(pl.lit(0, dtype=pl.Int8))
+        .alias(_DELAY_FLAG_COL)
+    )
+
+    out = df.with_columns(flag_expr)
+
+    # Diagnostic summary
+    n_severe  = out[_DELAY_FLAG_COL].eq(1).sum()
+    n_normal  = out[_DELAY_FLAG_COL].eq(0).sum()
+    n_null    = out[_DELAY_FLAG_COL].is_null().sum()
+    print(
+        f"Severe delay flag added (threshold > {threshold:.0f} min):\n"
+        f"  Severe (1) : {n_severe:>8,}  ({n_severe / out.height * 100:.1f}%)\n"
+        f"  Normal (0) : {n_normal:>8,}  ({n_normal / out.height * 100:.1f}%)\n"
+        f"  No travel  : {n_null:>8,}  ({n_null  / out.height * 100:.1f}%)"
+    )
+
+    return out
