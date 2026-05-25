@@ -1,6 +1,10 @@
 """optimization.py
 ==================
-Optuna-driven hyperparameter optimisation for the Phase 3 NPS classifier.
+Optuna-driven hyperparameter optimisation for the NPS classifier.
+
+Supports both **multi-class** mode (calibrated probabilities for Expected
+NPS) and **binary** mode (Detractor vs. Non-Detractor with class re-balancing
+for recall on the actionable churn-risk segment).
 
 Design notes
 ------------
@@ -9,22 +13,25 @@ Design notes
   is trying to predict — a textbook temporal-leakage trap.  We use
   ``TimeSeriesSplit(n_splits=3)`` which produces expanding-window folds
   ordered by ``npsDate``.
-* **``multi_logloss`` objective, not Macro-F1.**  Our downstream KPI is
-  Expected NPS ``= P(Promoter) − P(Detractor)``, which is a function of the
-  *raw probabilities*.  Optimising a threshold-dependent metric (F1) would
-  pick a model with strong rankings but poorly-calibrated probabilities.
-  Log-loss is the proper scoring rule for probability calibration.
-* **No ``class_weight='balanced'``.**  Re-weighting samples to equalise
-  classes shifts the predicted probabilities away from the empirical class
-  prior, which would silently bias the Expected NPS computation downward
-  (Detractors get up-weighted → predicted ``P(Detractor)`` becomes too high).
-  Class re-weighting is a tool for threshold-based F1 / recall, not for
-  probability-calibrated regression-of-probabilities pipelines.
+
+* **Log-loss as the objective in both modes.**  Log-loss is the proper
+  scoring rule for probability calibration regardless of class cardinality.
+  In multi-class mode we use ``sklearn.metrics.log_loss`` over the three
+  NPS labels; in binary mode we use the same function with ``labels=[0, 1]``,
+  which is mathematically equivalent to binary cross-entropy.
+
+* **Class weighting policy depends on the mode.**  Multi-class mode
+  intentionally avoids ``class_weight='balanced'`` because Expected NPS is
+  a probability-arithmetic KPI and re-weighting biases ``P(Detractor)``.
+  Binary mode, by contrast, is optimised for Detractor recall — the
+  calibration concern no longer applies because there is no
+  ``P(Promoter) − P(Detractor)`` arithmetic, so we re-enable balanced
+  weighting to surface the minority class at the trees' early splits.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import optuna
@@ -41,8 +48,46 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 # Constants
 # ---------------------------------------------------------------------------
 
-_NPS_CLASS_LABELS: tuple[int, int, int] = (0, 1, 2)  # Detractor / Passive / Promoter
+_MULTI_LABELS: tuple[int, int, int] = (0, 1, 2)   # Detractor / Passive / Promoter
+_BINARY_LABELS: tuple[int, int] = (0, 1)          # Non-Detractor / Detractor
 _N_SPLITS: int = 3
+
+TargetMode = Literal["multi", "binary"]
+_VALID_MODES: frozenset[str] = frozenset({"multi", "binary"})
+
+
+def _validate_mode(target_mode: str) -> None:
+    if target_mode not in _VALID_MODES:
+        raise ValueError(
+            f"target_mode must be one of {sorted(_VALID_MODES)}; got {target_mode!r}."
+        )
+
+
+def _build_lgbm(
+    target_mode: TargetMode,
+    params: dict[str, Any],
+    random_state: int,
+) -> LGBMClassifier:
+    """Construct a mode-appropriate ``LGBMClassifier`` from the trial params."""
+    if target_mode == "binary":
+        return LGBMClassifier(
+            objective="binary",
+            class_weight="balanced",
+            n_estimators=400,
+            random_state=random_state,
+            n_jobs=-1,
+            verbose=-1,
+            **params,
+        )
+    return LGBMClassifier(
+        objective="multiclass",
+        num_class=len(_MULTI_LABELS),
+        n_estimators=400,
+        random_state=random_state,
+        n_jobs=-1,
+        verbose=-1,
+        **params,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +98,7 @@ def optimize_lgbm_temporal(
     X: pd.DataFrame,
     y: pd.Series,
     n_trials: int = 20,
+    target_mode: TargetMode = "multi",
     random_state: int = 42,
 ) -> optuna.Study:
     """Run an Optuna study for the temporal LightGBM NPS classifier.
@@ -67,10 +113,15 @@ def optimize_lgbm_temporal(
         Feature matrix with categorical columns already cast to pandas
         ``category`` dtype (LightGBM auto-detects them).
     y:
-        Target vector containing the three NPS classes ``{0, 1, 2}``.
+        Target vector.
+        - ``target_mode="multi"`` → values in ``{0, 1, 2}``.
+        - ``target_mode="binary"`` → values in ``{0, 1}`` (Detractor = 1).
     n_trials:
-        Number of Optuna trials.  Defaults to ``20``, which empirically
-        converges well on this driver space.
+        Number of Optuna trials.  Defaults to ``20``.
+    target_mode:
+        ``"multi"`` (default) optimises a 3-class log-loss with no class
+        re-weighting; ``"binary"`` optimises binary cross-entropy with
+        ``class_weight='balanced'`` for Detractor recall.
     random_state:
         Seed for both the Optuna sampler and LightGBM.
 
@@ -80,10 +131,11 @@ def optimize_lgbm_temporal(
         Completed study.  Best parameters live in ``study.best_params`` and
         the best objective value (mean fold log-loss) in ``study.best_value``.
     """
+    _validate_mode(target_mode)
     if len(X) != len(y):
-        raise ValueError(
-            f"X and y length mismatch: {len(X)} vs {len(y)}."
-        )
+        raise ValueError(f"X and y length mismatch: {len(X)} vs {len(y)}.")
+
+    labels = list(_BINARY_LABELS) if target_mode == "binary" else list(_MULTI_LABELS)
 
     def objective(trial: optuna.Trial) -> float:
         params: dict[str, Any] = {
@@ -100,23 +152,11 @@ def optimize_lgbm_temporal(
             X_fold_train, X_fold_val = X.iloc[train_idx], X.iloc[val_idx]
             y_fold_train, y_fold_val = y.iloc[train_idx], y.iloc[val_idx]
 
-            model = LGBMClassifier(
-                objective="multiclass",
-                num_class=len(_NPS_CLASS_LABELS),
-                n_estimators=400,
-                random_state=random_state,
-                n_jobs=-1,
-                verbose=-1,
-                **params,
-            )
+            model = _build_lgbm(target_mode, params, random_state)
             model.fit(X_fold_train, y_fold_train)
 
             y_pred_proba = model.predict_proba(X_fold_val)
-            fold_loss = log_loss(
-                y_fold_val,
-                y_pred_proba,
-                labels=list(_NPS_CLASS_LABELS),
-            )
+            fold_loss = log_loss(y_fold_val, y_pred_proba, labels=labels)
             fold_losses.append(fold_loss)
 
             # Prune aggressively if the running mean drifts up between folds.

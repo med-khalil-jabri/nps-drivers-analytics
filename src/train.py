@@ -1,6 +1,7 @@
 """train.py
 =============
-Training utilities for the Phase 3 NPS classifier.
+Training utilities for the NPS classifier — supports both multi-class and
+binary deployment modes via a single ``target_mode`` switch.
 
 This module owns:
 
@@ -8,14 +9,18 @@ This module owns:
   by ``npsDate`` — never randomly.
 * The **feature-matrix builder** that converts the Polars feature frame into
   a pandas DataFrame with the proper ``category`` dtypes that LightGBM
-  consumes natively.
+  consumes natively.  In ``binary`` mode the original 3-class target
+  ``{Detractor=0, Passive=1, Promoter=2}`` is collapsed to
+  ``{Non-Detractor=0, Detractor=1}``.
 * The **final-model trainer** that fits a single ``LGBMClassifier`` with the
-  Optuna-selected hyperparameters on the full training fold.
+  Optuna-selected hyperparameters on the full training fold.  Multi-class
+  mode keeps probabilities calibrated for Expected NPS; binary mode uses
+  ``class_weight='balanced'`` to maximise Detractor recall.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 import polars as pl
@@ -36,6 +41,21 @@ _META_COLS: tuple[str, ...] = (
 
 _TARGET_COL: str = "nps_class"
 _NUM_CLASSES: int = 3
+
+# Original multi-class label for Detractors — promoted to the positive class
+# (1) when in binary mode, because Detractor identification is the actionable
+# business question.
+_DETRACTOR_LABEL: int = 0
+
+TargetMode = Literal["multi", "binary"]
+_VALID_MODES: frozenset[str] = frozenset({"multi", "binary"})
+
+
+def _validate_mode(target_mode: str) -> None:
+    if target_mode not in _VALID_MODES:
+        raise ValueError(
+            f"target_mode must be one of {sorted(_VALID_MODES)}; got {target_mode!r}."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +107,7 @@ def temporal_train_test_split(
 
 def get_feature_matrix(
     df: pl.DataFrame,
+    target_mode: TargetMode = "multi",
     target_col: str = _TARGET_COL,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Convert a Polars feature frame into a LightGBM-ready (X, y) pair.
@@ -100,15 +121,23 @@ def get_feature_matrix(
     ----------
     df:
         Polars DataFrame containing both features and the target column.
+    target_mode:
+        - ``"multi"`` (default) — preserve the original three NPS classes
+          ``{Detractor=0, Passive=1, Promoter=2}``.
+        - ``"binary"`` — collapse to ``{Non-Detractor=0, Detractor=1}``,
+          promoting Detractors to the positive class so that
+          ``class_weight='balanced'`` and recall-oriented metrics target
+          the actionable churn-risk segment.
     target_col:
-        Name of the target column.  Defaults to ``"nps_class"``.
+        Name of the source target column.  Defaults to ``"nps_class"``.
 
     Returns
     -------
     (X, y)
         ``X``: pandas DataFrame of features (numeric + ``category`` dtypes).
-        ``y``: pandas Series of integer NPS class labels.
+        ``y``: pandas Series of integer class labels.
     """
+    _validate_mode(target_mode)
     if target_col not in df.columns:
         raise KeyError(f"target column '{target_col}' not found in DataFrame.")
 
@@ -121,7 +150,15 @@ def get_feature_matrix(
         if isinstance(X_pl.schema[col], pl.Categorical):
             X_pd[col] = X_pd[col].astype("category")
 
-    y: pd.Series = df[target_col].to_pandas().astype("int8")
+    y_raw: pd.Series = df[target_col].to_pandas().astype("int8")
+
+    if target_mode == "binary":
+        # Detractor (original label 0) → 1  (positive class)
+        # Passive / Promoter (original 1, 2) → 0  (negative class)
+        y = (y_raw == _DETRACTOR_LABEL).astype("int8")
+        y.name = "is_detractor"
+    else:
+        y = y_raw
 
     return X_pd, y
 
@@ -130,10 +167,11 @@ def train_final_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     best_params: dict[str, Any],
+    target_mode: TargetMode = "multi",
     n_estimators: int = 600,
     random_state: int = 42,
 ) -> LGBMClassifier:
-    """Fit the final multi-class LightGBM model on the full Train fold.
+    """Fit the final LightGBM model on the full Train fold.
 
     The full-fit boosting round budget (``n_estimators``) is set higher
     than the per-trial budget used during HPO, because at this point we are
@@ -147,6 +185,10 @@ def train_final_model(
         Training target vector.
     best_params:
         Optuna's ``study.best_params`` dict.
+    target_mode:
+        ``"multi"`` (calibrated probabilities, no class re-weighting) or
+        ``"binary"`` (``objective='binary'`` with ``class_weight='balanced'``
+        to maximise Detractor recall).
     n_estimators:
         Number of boosting rounds for the final fit.  Defaults to ``600``.
     random_state:
@@ -157,14 +199,28 @@ def train_final_model(
     LGBMClassifier
         Fitted classifier ready for inference.
     """
-    model = LGBMClassifier(
-        objective="multiclass",
-        num_class=_NUM_CLASSES,
-        n_estimators=n_estimators,
-        random_state=random_state,
-        n_jobs=-1,
-        verbose=-1,
-        **best_params,
-    )
+    _validate_mode(target_mode)
+
+    if target_mode == "binary":
+        model = LGBMClassifier(
+            objective="binary",
+            class_weight="balanced",
+            n_estimators=n_estimators,
+            random_state=random_state,
+            n_jobs=-1,
+            verbose=-1,
+            **best_params,
+        )
+    else:
+        model = LGBMClassifier(
+            objective="multiclass",
+            num_class=_NUM_CLASSES,
+            n_estimators=n_estimators,
+            random_state=random_state,
+            n_jobs=-1,
+            verbose=-1,
+            **best_params,
+        )
+
     model.fit(X_train, y_train)
     return model

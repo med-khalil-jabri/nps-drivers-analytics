@@ -32,14 +32,34 @@ from sklearn.metrics import classification_report, confusion_matrix
 # Constants
 # ---------------------------------------------------------------------------
 
-_CLASS_LABELS: dict[int, str] = {
+# Friendly labels for the multi-class NPS targets.  Binary mode uses a
+# separate map because the integer codes have a different semantic meaning:
+# in binary mode 1 = Detractor (positive class), 0 = Non-Detractor.
+_MULTI_CLASS_LABELS: dict[int, str] = {
     0: "Detractor",
     1: "Passive",
     2: "Promoter",
 }
+_BINARY_CLASS_LABELS: dict[int, str] = {
+    0: "Non-Detractor",
+    1: "Detractor",
+}
 
 _DETRACTOR_CLASS: int = 0
 _PROMOTER_CLASS: int = 2
+
+
+def _resolve_class_labels(class_codes: list[int]) -> dict[int, str]:
+    """Pick a label map that matches the model's ``classes_`` array.
+
+    Falls back to a literal-int label if the codes don't match either of the
+    known schemas, so the function never crashes on an unexpected target.
+    """
+    if set(class_codes) == set(_MULTI_CLASS_LABELS.keys()):
+        return _MULTI_CLASS_LABELS
+    if set(class_codes) == set(_BINARY_CLASS_LABELS.keys()):
+        return _BINARY_CLASS_LABELS
+    return {code: f"Class {code}" for code in class_codes}
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +73,10 @@ def evaluate_model(
 ) -> None:
     """Print a classification report and plot the confusion matrix.
 
+    Works for both multi-class (three NPS segments) and binary
+    (Detractor vs. Non-Detractor) models — labels are derived from
+    ``model.classes_`` rather than hard-coded.
+
     Parameters
     ----------
     model:
@@ -64,22 +88,28 @@ def evaluate_model(
     """
     y_pred = model.predict(X_test)
 
+    class_codes: list[int] = [int(c) for c in model.classes_]
+    label_map = _resolve_class_labels(class_codes)
+    label_names = [label_map[c] for c in class_codes]
+
+    mode_tag = "Binary" if len(class_codes) == 2 else "Multi-class"
+
     print("=" * 64)
-    print("Classification Report — OOT Test Set")
+    print(f"Classification Report — {mode_tag} — OOT Test Set")
     print("=" * 64)
     print(
         classification_report(
             y_test,
             y_pred,
-            labels=list(_CLASS_LABELS.keys()),
-            target_names=list(_CLASS_LABELS.values()),
+            labels=class_codes,
+            target_names=label_names,
             digits=4,
             zero_division=0,
         )
     )
 
     # Confusion matrix (rows = true, cols = predicted)
-    cm = confusion_matrix(y_test, y_pred, labels=list(_CLASS_LABELS.keys()))
+    cm = confusion_matrix(y_test, y_pred, labels=class_codes)
     cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
     annotations = np.array([
         [f"{cm[i, j]:,}\n({cm_norm[i, j] * 100:.1f}%)"
@@ -87,22 +117,26 @@ def evaluate_model(
         for i in range(cm.shape[0])
     ])
 
-    fig, ax = plt.subplots(figsize=(7, 5.5))
+    fig, ax = plt.subplots(figsize=(6.5, 5.5) if len(class_codes) == 2 else (7, 5.5))
     sns.heatmap(
         cm,
         annot=annotations,
         fmt="",
         cmap="Blues",
         cbar=True,
-        xticklabels=list(_CLASS_LABELS.values()),
-        yticklabels=list(_CLASS_LABELS.values()),
+        xticklabels=label_names,
+        yticklabels=label_names,
         ax=ax,
         linewidths=0.4,
         linecolor="white",
     )
     ax.set_xlabel("Predicted Class")
     ax.set_ylabel("True Class")
-    ax.set_title("Confusion Matrix — OOT Test Set\nAbsolute counts + row-normalised %", pad=10)
+    ax.set_title(
+        f"Confusion Matrix — {mode_tag} — OOT Test Set\n"
+        f"Absolute counts + row-normalised %",
+        pad=10,
+    )
     plt.tight_layout()
     plt.show()
 
