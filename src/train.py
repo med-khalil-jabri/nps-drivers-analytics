@@ -20,7 +20,7 @@ This module owns:
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import pandas as pd
 import polars as pl
@@ -105,50 +105,71 @@ def temporal_train_test_split(
     return train_df, test_df
 
 
+def _frame_to_feature_pandas(df: pl.DataFrame, drop_cols: list[str]) -> pd.DataFrame:
+    """Drop metadata, convert to pandas, and cast Polars Categoricals to pandas ``category``."""
+    X_pl = df.drop(drop_cols)
+    X_pd: pd.DataFrame = X_pl.to_pandas()
+    for col in X_pl.columns:
+        if isinstance(X_pl.schema[col], pl.Categorical):
+            X_pd[col] = X_pd[col].astype("category")
+    return X_pd
+
+
 def get_feature_matrix(
     df: pl.DataFrame,
-    target_mode: TargetMode = "multi",
+    target_mode: TargetMode = "binary",
     target_col: str = _TARGET_COL,
-) -> tuple[pd.DataFrame, pd.Series]:
+    is_inference: bool = False,
+) -> tuple[pd.DataFrame, Optional[pd.Series]]:
     """Convert a Polars feature frame into a LightGBM-ready (X, y) pair.
 
     Metadata columns (``sourceId``, ``sourceUniqueId``, ``npsDate``,
-    ``npsScore``, ``nps_class``) are removed.  Categorical columns are
-    cast to pandas ``category`` dtype so that LightGBM picks them up via
-    its default ``categorical_feature='auto'`` setting.
+    ``npsScore``, ``nps_class``) are removed if present.  Categorical
+    columns are cast to pandas ``category`` dtype so that LightGBM picks
+    them up via its default ``categorical_feature='auto'`` setting.
 
     Parameters
     ----------
     df:
-        Polars DataFrame containing both features and the target column.
+        Polars DataFrame.  In training mode it must contain ``target_col``;
+        in inference mode the target column is not required.
     target_mode:
-        - ``"multi"`` (default) — preserve the original three NPS classes
+        - ``"binary"`` (default) — collapse to
+          ``{Non-Detractor=0, Detractor=1}``, promoting Detractors to the
+          positive class so that ``class_weight='balanced'`` and
+          recall-oriented metrics target the actionable churn-risk segment.
+        - ``"multi"`` — preserve the original three NPS classes
           ``{Detractor=0, Passive=1, Promoter=2}``.
-        - ``"binary"`` — collapse to ``{Non-Detractor=0, Detractor=1}``,
-          promoting Detractors to the positive class so that
-          ``class_weight='balanced'`` and recall-oriented metrics target
-          the actionable churn-risk segment.
+
+        Ignored when ``is_inference=True``.
     target_col:
         Name of the source target column.  Defaults to ``"nps_class"``.
+    is_inference:
+        When ``True``, skip target-column extraction and return
+        ``(X, None)``.  Use this path for scoring Live data where the
+        true NPS label does not exist.
 
     Returns
     -------
     (X, y)
         ``X``: pandas DataFrame of features (numeric + ``category`` dtypes).
-        ``y``: pandas Series of integer class labels.
+        ``y``: pandas Series of integer class labels, or ``None`` when
+        ``is_inference=True``.
     """
+    if is_inference:
+        # Drop only the metadata columns that actually exist — Live data
+        # never carries ``npsScore`` or ``nps_class``, so we cannot rely on
+        # them being present.
+        drop_cols = [c for c in _META_COLS if c in df.columns]
+        X_pd = _frame_to_feature_pandas(df, drop_cols)
+        return X_pd, None
+
     _validate_mode(target_mode)
     if target_col not in df.columns:
         raise KeyError(f"target column '{target_col}' not found in DataFrame.")
 
     cols_to_drop = [c for c in _META_COLS if c in df.columns]
-    X_pl = df.drop(cols_to_drop)
-    X_pd: pd.DataFrame = X_pl.to_pandas()
-
-    # Cast Polars Categorical → pandas category for native LGBM handling.
-    for col in X_pl.columns:
-        if isinstance(X_pl.schema[col], pl.Categorical):
-            X_pd[col] = X_pd[col].astype("category")
+    X_pd = _frame_to_feature_pandas(df, cols_to_drop)
 
     y_raw: pd.Series = df[target_col].to_pandas().astype("int8")
 
