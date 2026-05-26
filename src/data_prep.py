@@ -193,49 +193,19 @@ def load_and_pivot_data(
             n_rows=n_rows,
         )
 
-    return pivot_eav_block(raw, definitions_map)
-
-
-def pivot_eav_block(
-    raw: pl.DataFrame,
-    definitions_map: dict[str, pl.DataType],
-) -> pl.DataFrame:
-    """Pivot a *raw EAV block* to wide and apply strict type casting.
-
-    This is the post-I/O half of :func:`load_and_pivot_data`, exposed as a
-    standalone helper so that the Phase-5 chunked / hash-sharded streaming
-    pipeline can reuse the exact same pivot + cast logic without going
-    through a CSV read.  Calling code is expected to have already loaded
-    the EAV rows into a Polars DataFrame with every column typed as
-    ``pl.String`` (the schema-agnostic ingestion convention).
-
-    Parameters
-    ----------
-    raw:
-        Polars DataFrame of *raw EAV rows* (one row per
-        ``(sourceId, driverKey)`` observation).  All columns must be
-        ``pl.String``.
-    definitions_map:
-        Output of :func:`parse_driver_definitions`.
-
-    Returns
-    -------
-    pl.DataFrame
-        Wide-format DataFrame: one row per customer, one column per driver
-        key.  Numeric columns are ``Float32``, categorical columns are
-        ``Categorical``, multi-categorical columns remain ``String``.
-        ``npsDate`` is parsed to ``pl.Date`` and ``npsScore`` (if present)
-        is cast to ``pl.Int8``.
-    """
-    # Determine pivot index (auto-detect npsScore presence — Live has none).
+    # ------------------------------------------------------------------
+    # Step 2 — Determine pivot index (auto-detect npsScore presence)
+    # ------------------------------------------------------------------
     has_nps_score: bool = "npsScore" in raw.columns
 
     index_cols: list[str] = ["sourceId", "sourceUniqueId", "npsDate"]
     if has_nps_score:
         index_cols.append("npsScore")
 
-    # Pivot: EAV → wide (one row per customer).
-    # aggregate_function="first" handles accidental duplicate driver rows.
+    # ------------------------------------------------------------------
+    # Step 3 — Pivot: EAV → wide (one row per customer)
+    # aggregate_function="first" handles accidental duplicate driver rows
+    # ------------------------------------------------------------------
     wide: pl.DataFrame = raw.pivot(
         on="driverKey",
         index=index_cols,
@@ -243,7 +213,9 @@ def pivot_eav_block(
         aggregate_function="first",
     )
 
-    # Type casting with empty-string normalisation.
+    # ------------------------------------------------------------------
+    # Step 4 — Type casting with empty-string normalisation
+    # ------------------------------------------------------------------
     cast_exprs: list[pl.Expr] = _build_cast_exprs(
         columns=wide.columns,
         definitions_map=definitions_map,
@@ -252,7 +224,10 @@ def pivot_eav_block(
     if cast_exprs:
         wide = wide.with_columns(cast_exprs)
 
-    # npsDate: strip timezone suffix and parse to pl.Date.
+    # ------------------------------------------------------------------
+    # Step 5 — Clean up metadata columns
+    # ------------------------------------------------------------------
+    # npsDate: strip timezone suffix and parse to pl.Date
     wide = wide.with_columns(
         pl.col("npsDate")
         .str.slice(0, 10)                          # "YYYY-MM-DD", drop tz suffix
@@ -260,7 +235,7 @@ def pivot_eav_block(
         .alias("npsDate")
     )
 
-    # npsScore: cast to Int8 (values are 0 / 7 / 10 — fit in 8 bits).
+    # npsScore: cast to Int8 (values are 0 / 7 / 10 — fit in 8 bits)
     if has_nps_score:
         wide = wide.with_columns(
             pl.col("npsScore").cast(pl.Int8, strict=False)
