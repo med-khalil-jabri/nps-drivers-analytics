@@ -12,6 +12,9 @@ wheels/
 # Data
 data/
 
+# Models
+models/
+
 # macOS
 .DS_Store
 
